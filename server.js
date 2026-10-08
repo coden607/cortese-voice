@@ -7,8 +7,27 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
+// Boot-time sanity: warn (never crash) on missing/placeholder config.
+const REQUIRED_ENV = ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE', 'PUBLIC_URL', 'OPENROUTER_KEY'];
+for (const key of REQUIRED_ENV) {
+  const val = process.env[key];
+  if (!val || /xxxx|your-|example/i.test(val)) {
+    console.warn(`[cortese-voice] WARNING: ${key} is missing or looks like a placeholder — live calls/LLM will fail until .env is filled in.`);
+  }
+}
+
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-const llm = new OpenAI({ baseURL: 'https://openrouter.ai/api/v1', apiKey: process.env.OPENROUTER_KEY });
+
+// Lazy LLM client: the OpenAI SDK throws at construction if apiKey is unset,
+// which would crash the whole server before Twilio webhooks can even answer.
+let _llm = null;
+function getLLM() {
+  if (!_llm) {
+    if (!process.env.OPENROUTER_KEY) return null;
+    _llm = new OpenAI({ baseURL: 'https://openrouter.ai/api/v1', apiKey: process.env.OPENROUTER_KEY });
+  }
+  return _llm;
+}
 
 const VOICE = process.env.TWILIO_VOICE || 'Polly.Joanna';
 const FROM = process.env.TWILIO_PHONE;
@@ -46,15 +65,24 @@ function twimlSay(text) {
 app.post('/call', async (req, res) => {
   const { to } = req.body;
   if (!to) return res.status(400).json({ error: 'need {to: E.164 number}' });
-  const call = await client.calls.create({
-    to, from: FROM,
-    url: `${process.env.PUBLIC_URL}/voice`,
-    statusCallback: `${process.env.PUBLIC_URL}/status`,
-    statusCallbackEvent: ['completed'],
-    machineDetection: 'Enable', // skip voicemail boxes politely
-  });
-  calls.set(call.sid, { history: [], outcome: null, to });
-  res.json({ sid: call.sid, to });
+  if (!FROM || !process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+    return res.status(503).json({ error: 'Twilio not configured — fill .env (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE)' });
+  }
+  try {
+    const call = await client.calls.create({
+      to, from: FROM,
+      url: `${process.env.PUBLIC_URL}/voice`,
+      statusCallback: `${process.env.PUBLIC_URL}/status`,
+      statusCallbackEvent: ['completed'],
+      machineDetection: 'Enable', // skip voicemail boxes politely
+    });
+    calls.set(call.sid, { history: [], outcome: null, to });
+    res.json({ sid: call.sid, to });
+  } catch (e) {
+    // Twilio rejects (401 bad creds, 21612 invalid number, etc.) become clean JSON, never an HTML stack trace
+    console.error('Twilio call error:', e.message);
+    res.status(502).json({ error: `twilio: ${e.message}` });
+  }
 });
 
 // First contact
@@ -103,6 +131,10 @@ async function replyWithGather(res, sid, text) {
 }
 
 async function getAgentReply(state) {
+  const llm = getLLM();
+  if (!llm) {
+    return "Stephen will follow up personally — I'll have him call you back. Thanks for your time! [[END: llm-not-configured, manual follow-up]]";
+  }
   try {
     const r = await llm.chat.completions.create({
       model: process.env.LLM_MODEL || 'anthropic/claude-3.5-haiku',
