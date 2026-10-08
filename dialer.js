@@ -14,12 +14,23 @@ if (fs.existsSync('./outcomes.jsonl')) {
   }
 }
 
+// channel-collision guard: businesses already contacted by email are human-lane.
+// emailed-leads.txt = one business name per line (matched case-insensitively).
+const emailed = new Set();
+if (fs.existsSync('./emailed-leads.txt')) {
+  for (const line of fs.readFileSync('./emailed-leads.txt', 'utf8').split('\n')) {
+    const l = line.trim().toLowerCase();
+    if (l && !l.startsWith('#')) emailed.add(l);
+  }
+}
+
 const queue = fs.readFileSync('call-queue.csv', 'utf8').trim().split('\n').slice(1)
   .map(l => { const m = l.match(/"(.*?)","(.*?)","(.*?)","(\d+)"/); return m ? { name: m[1], town: m[2], phone: m[4] } : null; })
   .filter(Boolean)
-  .filter(q => !dialed.has(q.phone));
+  .filter(q => !dialed.has(q.phone))
+  .filter(q => { const hit = [...emailed].find(e => q.name.toLowerCase().includes(e.split('(')[0].trim()) || e.includes(q.name.toLowerCase())); if (hit) console.log('  skip (emailed):', q.name); return !hit; });
 
-console.log(`${queue.length} undialed leads in queue (pacing: ${MAX}/run, ${GAP/1000}s gap)`);
+console.log(`${queue.length} undialed, unemailed leads in queue (pacing: ${MAX}/run, ${GAP/1000}s gap)`);
 
 (async () => {
   let sent = 0;
